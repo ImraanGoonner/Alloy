@@ -1,0 +1,201 @@
+Troubleshooting: Missing namespace Structured Metadata with clusterEvents + OTLP
+Table of Contents
+
+Summary
+
+Affected Setup
+
+Why namespace Disappeared but namespace2 Showed Up
+
+Root Cause (OTLP Transform Deletes namespace)
+
+Correct Usage: stage.labels vs stage.logfmt
+
+Solutions
+
+Option A — Fix the OTLP transform (recommended)
+
+Option B — If you need namespace as an indexed label with OTLP
+
+Option C — Bypass OTLP transforms and send directly to Loki
+
+Validation Tips
+
+Final Working Snippet
+
+FAQ
+
+Summary
+
+Issue: With the grafana-k8s-monitoring Helm chart (clusterEvents.enabled=true), mapping k8s_namespace_name → namespace and adding it to structured_metadata (SM) results in only namespace2 being present; namespace is missing.
+
+Cause: Logs go through the chart’s OTLP transform pipeline (OTTL) which deletes the namespace attribute after your extraLogProcessingStages.
+
+Fix: Adjust the OTLP transform to set (and not delete) namespace from k8s.namespace.name. If you need namespace as an indexed label, either request label promotion for your tenant (Grafana Cloud support) or send directly to Loki (non-OTLP) and promote via loki.process.
+
+Affected Setup
+
+Helm: grafana-k8s-monitoring (v3.2.0 mentioned) on OpenShift
+
+Feature: clusterEvents
+
+Ingest: Alloy/Collector OTLP gateway → Grafana Cloud OTLP endpoint
+
+User config (excerpt):
+
+clusterEvents:
+  enabled: true
+  excludeNamespaces:
+    - openshift-marketplace
+  extraLogProcessingStages: |-
+    stage.logfmt {
+      mapping = {
+        "namespace" = "k8s_namespace_name",
+      }
+    }
+    stage.labels {
+      values = {
+        namespace = "k8s_namespace_name",
+      }
+    }
+    stage.structured_metadata {
+      values = {
+        namespace = "",
+        namespace2 = "namespace",
+      }
+    }
+
+Why namespace Disappeared but namespace2 Showed Up
+
+The pipeline distinguishes between:
+
+Indexed labels (Loki labels)
+
+Extracted values / attributes (available during processing; later stored as SM if not promoted)
+
+Your stage.structured_metadata could still set namespace2 from the extracted namespace value. But a later OTLP transform removed the namespace attribute before export, so namespace SM never arrived.
+
+Root Cause (OTLP Transform Deletes namespace)
+
+The Helm chart renders an OTTL block (OpenTelemetry Collector transform) that includes a statement like:
+
+delete_key(attributes, "namespace") where attributes["namespace"] == resource.attributes["k8s.namespace.name"]
+
+
+Because this runs after your extraLogProcessingStages, the namespace you set earlier gets deleted.
+
+Correct Usage: stage.labels vs stage.logfmt
+
+Use stage.logfmt when you need to parse key=value pairs from the log line itself into extracted fields.
+
+Use stage.labels to create/rename labels from already-parsed values or existing labels.
+
+In many clusterEvents cases, k8s_namespace_name is already available as a field/label, so you can skip logfmt and just use stage.labels.
+
+Minimal working stages (direct-to-Loki case):
+
+stage.labels {
+  values = {
+    namespace = "k8s_namespace_name",
+  }
+}
+stage.structured_metadata {
+  values = {
+    namespace  = "",
+    namespace2 = "namespace",
+  }
+}
+
+Solutions
+Option A — Fix the OTLP transform (recommended)
+
+Ensure namespace persists as an attribute and is not deleted.
+
+OpenTelemetry Collector (YAML-style):
+
+processors:
+  transform:
+    logs:
+      resource:
+        - set(attributes["namespace"], attributes["k8s.namespace.name"])
+      # Remove or do not include any delete rule for "namespace"
+      # log:
+      #   - delete_key(attributes, "namespace") where attributes["namespace"] == resource.attributes["k8s.namespace.name"]
+
+
+Grafana Alloy / Flow (HCL-style) example:
+
+otelcol.processor.transform "otlp_gateway" {
+  logs {
+    resource {
+      statements = [
+        "set(attributes[\"namespace\"], attributes[\"k8s.namespace.name\"])",
+      ]
+    }
+    # Do not include deletes like:
+    # log {
+    #   statements = [
+    #     "delete_key(attributes, \"namespace\") where attributes[\"namespace\"] == resource.attributes[\"k8s.namespace.name\"]",
+    #   ]
+    # }
+  }
+}
+
+
+Place the set(...) in the resource context for logs, and ensure no subsequent delete removes it.
+
+Option B — If you need namespace as an indexed label with OTLP
+
+By default, Loki promotes only a specific set of OTLP attributes to indexed labels. Others become SM.
+
+If cost attribution requires namespace as an indexed label:
+
+Open a Grafana Cloud support ticket to promote namespace for your tenant, or
+
+Send directly to Loki (non-OTLP) and promote via loki.process stage.labels.
+
+References (default promotions): see Grafana Loki docs for OTLP format considerations.
+
+Option C — Bypass OTLP transforms and send directly to Loki
+
+Deliver logs straight to Loki (loki destination), then promote as a label:
+
+stage.labels {
+  values = {
+    namespace = "k8s_namespace_name"
+  }
+}
+
+Validation Tips
+
+Live Debugging: in Alloy, inspect the record before the OTLP export / loki.process.
+
+Search in Loki: compare Labels (indexed) vs Structured Metadata panes.
+
+Grep generated config for OTTL: look for any delete_key(attributes, "namespace").
+
+Temporary logging: print record right before export to confirm resource.attributes["namespace"] exists.
+
+Final Working Snippet
+
+The change that solved this in the investigation:
+
+processors:
+  transform:
+    logs:
+      log:
+        - set(resource.attributes["namespace"], resource.attributes["k8s.namespace.name"])
+
+
+(Depending on your chart version, an equivalent resource-context statement or HCL form may be used. The key is to copy k8s.namespace.name → namespace and avoid later deletes.)
+
+FAQ
+
+Q: Is my extraLogProcessingStages invalid?
+A: It’s valid, but when using OTLP → Grafana Cloud, later OTTL transforms may modify/delete attributes. The missing namespace was caused downstream by a delete rule.
+
+Q: When should I use stage.logfmt?
+A: Only when parsing fields that exist in the log line. If k8s_namespace_name already exists as a field/label, go straight to stage.labels.
+
+Q: Can I make namespace an indexed label with OTLP?
+A: Not by default. Request label promotion via support, or send directly to Loki and promote via processing rules.
