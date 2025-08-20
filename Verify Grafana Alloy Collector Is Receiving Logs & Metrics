@@ -1,0 +1,162 @@
+Verify Grafana Alloy Collector Is Receiving Logs & Metrics
+Table of Contents
+
+Summary
+
+Expected Data Paths
+
+Quick Verification Checklist
+
+Step-by-Step Checks
+
+1) Locate Alloy pods
+
+2) Find the Alloy config ConfigMap
+
+3) Inspect the Alloy config
+
+4) Confirm OTLP transform behavior
+
+5) (Optional) Live debug near the exporter
+
+Common Labels & Components
+
+Troubleshooting Notes
+
+Summary
+
+Yes—this setup uses Grafana Alloy as the in-cluster collector for logs and metrics.
+For the clusterEvents pipeline, logs typically flow:
+
+k8s events → loki.source.kubernetes_events → loki.process (your extra stages)
+→ otelcol.processor.transform (OTLP gateway) → (optional proxy Alloy)
+→ Grafana Cloud OTLP endpoint
+
+
+If attributes like namespace disappear, it’s usually because the OTLP transform stage changes or deletes them after your loki.process stages.
+
+Expected Data Paths
+
+Logs (clusterEvents):
+
+loki.source.kubernetes_events
+
+loki.process (contains your extraLogProcessingStages)
+
+otelcol.processor.transform (a.k.a. OTLP gateway transform)
+
+otelcol.exporter.otlphttp (to Grafana Cloud OTLP endpoint)
+
+Metrics:
+
+Prometheus-compatible scrape/receive via Alloy
+
+OTLP or remote_write export upstream (depends on chart config)
+
+Quick Verification Checklist
+
+ Alloy pods are running
+
+ Alloy config contains loki.source.kubernetes_events and loki.process
+
+ An OTLP transform processor exists (often named “otlp_gateway”)
+
+ No transform rule is deleting or renaming namespace unintentionally
+
+ If needed, a transform sets namespace from k8s.namespace.name
+
+Step-by-Step Checks
+
+Replace <ns> with your Alloy namespace if different.
+
+1) Locate Alloy pods
+kubectl get pods -A -l app.kubernetes.io/name=alloy
+# fallback labels that some charts use:
+kubectl get pods -A -l app.kubernetes.io/part-of=alloy
+kubectl get pods -A | grep -i alloy
+
+2) Find the Alloy config ConfigMap
+kubectl get cm -A | grep -Ei 'alloy|collector|grafana.*alloy'
+
+3) Inspect the Alloy config
+
+Print the first ~200 lines (repeat with higher ranges if needed):
+
+# Example key name; escape dots in jsonpath
+kubectl -n <ns> get cm <alloy-configmap-name> \
+  -o jsonpath='{.data.alloy\.config\.yaml}' | sed -n '1,200p'
+
+
+Look for these blocks (names may vary):
+
+loki.source.kubernetes_events
+
+loki.process { ... } (your extraLogProcessingStages)
+
+otelcol.processor.transform "otlp_gateway" (or similar)
+
+otelcol.exporter.otlphttp { ... }
+
+4) Confirm OTLP transform behavior
+
+Search the config for any delete or set statements affecting namespace:
+
+kubectl -n <ns> get cm <alloy-configmap-name> \
+  -o jsonpath='{.data.alloy\.config\.yaml}' | \
+  grep -E 'delete_key|set\(|namespace|k8s\.namespace\.name' -n
+
+
+If you see something like:
+
+delete_key(attributes, "namespace") ...
+
+
+that will remove namespace late in the pipeline.
+
+If your fix was applied, you should find:
+
+set(resource.attributes["namespace"], resource.attributes["k8s.namespace.name"])
+
+
+Goal: Preserve/restore namespace at the resource attribute level and ensure no subsequent delete removes it.
+
+5) (Optional) Live debug near the exporter
+
+If using Alloy Live Debugging, add a debug block just before the OTLP exporter to inspect records and confirm resource.attributes["namespace"] exists at that point.
+
+Common Labels & Components
+
+Alloy pod label: app.kubernetes.io/name=alloy (varies by chart)
+
+Kubernetes events source: loki.source.kubernetes_events
+
+Processing: loki.process (HCL stages like stage.labels, stage.structured_metadata, etc.)
+
+OTLP transform: otelcol.processor.transform "otlp_gateway" (name may differ)
+
+Exporter: otelcol.exporter.otlphttp (Grafana Cloud OTLP endpoint)
+
+Troubleshooting Notes
+
+If namespace must be an indexed label with OTLP ingestion to Grafana Cloud:
+
+Open a support request to promote namespace to an indexed label for your tenant, or
+
+Send directly to Loki (non-OTLP) and promote via loki.process stage.labels.
+
+Correct stage usage:
+
+Use stage.logfmt only to parse key=value pairs from the log line.
+
+Use stage.labels to create/rename labels from already-parsed fields (e.g., set namespace from k8s_namespace_name).
+
+Final fix example (what worked in practice):
+
+processors:
+  transform:
+    logs:
+      log:
+        - set(resource.attributes["namespace"], resource.attributes["k8s.namespace.name"])
+
+
+After applying, re-check the config and verify in Loki that namespace appears (as structured metadata by default; as an indexed label only if promoted).
