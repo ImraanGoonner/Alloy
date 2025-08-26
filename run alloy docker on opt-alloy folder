@@ -1,0 +1,13 @@
+Docker logs, mounting docker desktop socket:
+
+docker run -d \
+  --name alloyLab \
+  -v /var/log:/var/log:ro \
+  -v /opt/alloy:/etc/alloy \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -p 12346:12345 \
+  grafana/alloy:latest \
+    run \
+      --server.http.listen-addr=0.0.0.0:12345 \
+      --storage.path=/var/lib/alloy/data \
+      /etc/alloy
