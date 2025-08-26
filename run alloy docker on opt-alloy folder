@@ -11,3 +11,10 @@ docker run -d \
       --server.http.listen-addr=0.0.0.0:12345 \
       --storage.path=/var/lib/alloy/data \
       /etc/alloy
+
+
+------
+
+http://localhost:3100/ready
+http://localhost:3100/metrics
+http://localhost:3100/loki/api/v1/status/buildinfo
