@@ -1,0 +1,173 @@
+Adding Labels to Logs in Grafana Alloy
+
+This guide shows the common ways to attach labels to log lines collected by Grafana Alloy and shipped to Loki. It covers:
+
+What each component does
+
+When to add labels at discovery vs. processing time
+
+Copy-paste examples for both approaches
+
+Tips & gotchas
+
+Components & Responsibilities
+
+local.file_match — Discovers files to tail and can attach static labels per target (per file).
+
+loki.source.file — Tails/reads the discovered files and forwards entries downstream.
+
+loki.process — Optional pipeline to add or transform labels (and/or parse, relabel, etc.).
+
+loki.write — Sends the processed entries to Loki.
+
+Where should I add labels?
+
+In file_match when the label is tightly coupled to the file path
+(example: everything from /var/log/auth.log gets app="sshd").
+
+In loki.process when you want a central place for enrichment that applies to multiple sources, or you’re already doing other processing (parse, relabel, etc.).
+
+You can also combine both: coarse labels in file_match, global labels in loki.process.
+
+Base Skeleton (reference)
+local.file_match "local" {
+  path_targets = [{ __path__ = "/var/log/auth.log" }]
+  sync_period  = "10s"
+}
+
+loki.source.file "local" {
+  targets       = local.file_match.local.targets
+  tail_from_end = false
+  forward_to    = [loki.write.local.receiver] # or forward to a loki.process first
+}
+
+loki.write "local" {
+  endpoint { url = "http://localhost:3100/loki/api/v1/push" }
+}
+
+Option A — Add Labels in file_match (per target)
+Single file with labels
+local.file_match "local" {
+  path_targets = [{
+    __path__ = "/var/log/auth.log",
+    app      = "sshd",
+  }]
+  sync_period = "10s"
+}
+
+loki.source.file "local" {
+  targets       = local.file_match.local.targets
+  tail_from_end = false
+  forward_to    = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint { url = "http://localhost:3100/loki/api/v1/push" }
+}
+
+Multiple files with different labels
+local.file_match "local" {
+  path_targets = [
+    { __path__ = "/var/log/auth.log", color = "blue",  env = "prod" },
+    { __path__ = "/var/log/syslog",   color = "green", env = "dev"  },
+  ]
+  sync_period = "10s"
+}
+
+loki.source.file "local" {
+  targets       = local.file_match.local.targets
+  tail_from_end = false
+  forward_to    = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint { url = "http://localhost:3100/loki/api/v1/push" }
+}
+
+
+Use this when the label is an inherent property of that file path.
+
+Option B — Add Labels via loki.process (static_labels)
+One static_labels block (recommended)
+local.file_match "local" {
+  path_targets = [{ __path__ = "/var/log/auth.log" }]
+  sync_period  = "10s"
+}
+
+loki.source.file "local" {
+  targets       = local.file_match.local.targets
+  tail_from_end = false
+  forward_to    = [loki.process.add_labels.receiver]
+}
+
+loki.process "add_labels" {
+  stage.static_labels {
+    values = {
+      color  = "blue"
+      env    = "test"
+      deploy = "alloy"
+    }
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint { url = "http://localhost:3100/loki/api/v1/push" }
+}
+
+Multiple static_labels stages (functionally equivalent)
+loki.process "add_labels" {
+  stage.static_labels { values = { color  = "blue" } }
+  stage.static_labels { values = { env    = "test" } }
+  stage.static_labels { values = { deploy = "alloy" } }
+  forward_to = [loki.write.local.receiver]
+}
+
+
+Use this for a clean, shared enrichment pipeline or when you’re already parsing/transforming logs.
+
+Combined Approach
+
+Label files differently in file_match and apply global labels in loki.process:
+
+local.file_match "local" {
+  path_targets = [
+    { __path__ = "/var/log/auth.log", app = "sshd"   },
+    { __path__ = "/var/log/syslog",   app = "system" },
+  ]
+  sync_period = "10s"
+}
+
+loki.source.file "local" {
+  targets       = local.file_match.local.targets
+  tail_from_end = false
+  forward_to    = [loki.process.global_labels.receiver]
+}
+
+loki.process "global_labels" {
+  stage.static_labels {
+    values = {
+      env    = "prod"
+      deploy = "alloy"
+    }
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint { url = "http://localhost:3100/loki/api/v1/push" }
+}
+
+Tips & Gotchas
+
+Overwrites: stage.static_labels will overwrite an existing label with the same key.
+
+Cardinality: Avoid high-cardinality labels (for example, user_id) to keep Loki performance and costs healthy.
+
+Verification: After shipping, query in Explore with LogQL, e.g.:
+
+{"app"="sshd"}
+
+{"color"="blue"}
+
+Sync period: sync_period controls how often Alloy re-discovers targets (useful on rotations).
