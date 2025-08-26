@@ -171,3 +171,11 @@ Verification: After shipping, query in Explore with LogQL, e.g.:
 {"color"="blue"}
 
 Sync period: sync_period controls how often Alloy re-discovers targets (useful on rotations).
+
+
+Additional info:
+
+local.file_match → use this when a label is intrinsic to the file path and should always be on every line from that file (e.g., /var/log/auth.log → app="sshd"). It’s per-target, “baked in” at discovery time.
+
+loki.process → by “global,” I mean labels added in a central pipeline that can apply to many or all sources flowing through that processor (e.g., env="prod", deploy="alloy"). It’s great for shared, cross-file enrichment or when you’re already parsing/relabeling.
+
