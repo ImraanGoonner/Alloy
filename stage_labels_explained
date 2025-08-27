@@ -1,0 +1,266 @@
+Loki label stages cheat-sheet (with JSON examples)
+
+This note explains when to use stage.static_labels, stage.labels, and stage.relabel in Grafana Alloy’s loki.process pipeline, and how they interact. Examples show JSON log lines and the resulting labels/streams so you can paste into GitHub.
+
+TL;DR
+
+stage.static_labels — add constant key/value labels to every line (e.g., env="prod").
+
+stage.labels — promote parsed fields (from json, logfmt, regex, …) to labels. It does not parse; it copies existing extracted fields into labels.
+
+stage.relabel — rename/replace/drop labels (works on labels only, not raw fields).
+
+Streams in Loki are defined by their label set. Adding/removing/changing labels creates new streams.
+
+1) Add constant labels with stage.static_labels
+
+Use when: the value never changes for this pipeline (team, environment, deployment, etc.).
+
+Input log line (JSON):
+
+{"ts":"2025-08-26T12:00:00Z","level":"info","msg":"user login","user_id":"42"}
+
+
+Alloy (River) config:
+
+loki.process "add_static" {
+  stage.static_labels {
+    values = { env = "prod", team = "payments" }
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+
+Resulting stream labels (JSON-ish view):
+
+{
+  "env": "prod",
+  "team": "payments",
+  // plus any labels from discovery (job, instance, filename, etc.)
+}
+
+2) Promote parsed fields with stage.labels
+
+Use when: the value comes from the log content (e.g., user_id, request_id, tenant).
+
+stage.labels assumes fields are already extracted. Add a parsing stage first (e.g., json, logfmt, or regex).
+
+Input log line (JSON):
+
+{"ts":"2025-08-26T12:00:01Z","level":"info","msg":"payment","tenant":"acme","order_id":"A123"}
+
+
+Alloy config:
+
+loki.process "parse_and_label" {
+  stage.json { }  // parses JSON into fields: ts, level, msg, tenant, order_id
+  stage.labels {
+    values = {
+      tenant   = "tenant"
+      order_id = "order_id"
+    }
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+
+Resulting stream labels:
+
+{
+  "tenant": "acme",
+  "order_id": "A123"
+}
+
+
+If the field doesn’t exist (for that line), no label is added for that key.
+
+3) Manipulate label keys/values with stage.relabel
+
+Use when: you need to rename/overwrite/drop labels, or compose a new value from an existing label.
+
+Examples:
+
+A) Prefix an existing label value
+
+loki.process "prefix_instance" {
+  stage.relabel {
+    rule {
+      action        = "replace"
+      source        = "instance"
+      target_label  = "instance"
+      regex         = "(.*)"
+      replacement   = "edge-${1}"
+    }
+  }
+}
+
+
+Before → After (labels):
+
+{"instance":"redis-01"}  ->  {"instance":"edge-redis-01"}
+
+
+B) Copy one label into another
+
+stage.relabel {
+  rule {
+    action       = "replace"
+    source       = "k8s_namespace"
+    target_label = "namespace"
+    regex        = "(.*)"
+    replacement  = "${1}"
+  }
+}
+
+
+C) Drop a noisy label
+
+stage.relabel {
+  rule {
+    action      = "labeldrop"
+    regex       = "pod_uid"  // remove label named pod_uid
+  }
+}
+
+4) Adding labels at discovery vs. in processing
+
+You can attach labels early via local.file_match or later in loki.process.
+
+Option A — At discovery time (local.file_match)
+
+Use when: the label is tightly coupled to the file path (e.g., everything from /var/log/auth.log is app="sshd").
+
+local.file_match "local" {
+  path_targets = [
+    { __path__ = "/var/log/auth.log", app = "sshd", color = "blue" },
+    { __path__ = "/var/log/syslog",   app = "system", color = "green" }
+  ]
+  sync_period = "10s"
+}
+
+loki.source.file "local" {
+  targets       = local.file_match.local.targets
+  tail_from_end = false
+  forward_to    = [loki.write.local.receiver]
+}
+
+
+Result: every line from /var/log/auth.log carries app="sshd", color="blue".
+
+Option B — In processing (loki.process)
+
+Use when: you want a central enrichment point that can apply to many sources, or you’re already parsing/relabelling.
+
+loki.process "global_enrichment" {
+  stage.static_labels {
+    values = { env = "prod", deploy = "alloy" }
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+
+⚠️ If you define the same label key in multiple places (e.g., app in file_match and again in static_labels), the later stage’s value wins for new lines, and you’ll create new streams. Make sure that’s intended.
+
+5) Why “stage labels didn’t show up” when file_match also had labels
+
+Common causes:
+
+No parsed fields: stage.labels promotes fields, so if you didn’t add a json/logfmt/regex stage first, there’s nothing to promote.
+
+Query mismatch: In Explore, if your query matches the old stream (label set without your new label) you won’t see the new label. Add the new label to the matcher or widen the query.
+
+Duplicate keys: Setting label foo in file_match and again via static_labels may split streams. Use unique keys or deliberately overwrite with relabel.
+
+6) Minimal end-to-end examples
+A) Labels from file_match only
+local.file_match "local" {
+  path_targets = [
+    { __path__ = "/var/log/auth.log", app = "sshd", env = "prod" }
+  ]
+  sync_period = "10s"
+}
+
+loki.source.file "local" {
+  targets       = local.file_match.local.targets
+  tail_from_end = false
+  forward_to    = [loki.write.local.receiver]
+}
+
+
+Stream labels (conceptual):
+
+{ "app": "sshd", "env": "prod", "filename": "/var/log/auth.log", "job": "…", "instance": "…" }
+
+B) Parse JSON and promote fields
+loki.process "parse_and_promote" {
+  stage.json { }
+  stage.labels {
+    values = { user = "user_id", tenant = "tenant" }
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+
+Input line:
+
+{"user_id":"42","tenant":"acme","msg":"ok"}
+
+
+Adds labels:
+
+{ "user": "42", "tenant": "acme" }
+
+C) Static + promote + relabel (full chain)
+loki.process "full" {
+  stage.static_labels {
+    values = { env = "staging", team = "checkout" }
+  }
+
+  stage.json { } // parse JSON log lines
+
+  stage.labels {
+    values = { request = "request_id" }  // promote parsed field
+  }
+
+  stage.relabel {
+    // rename 'team' to 'service_team'
+    rule {
+      action       = "replace"
+      source       = "team"
+      target_label = "service_team"
+      regex        = "(.*)"
+      replacement  = "${1}"
+    }
+    // drop original 'team'
+    rule { action = "labeldrop", regex = "team" }
+  }
+
+  forward_to = [loki.write.local.receiver]
+}
+
+
+Final labels (conceptual):
+
+{ "env":"staging", "service_team":"checkout", "request":"abcdef1234", ... }
+
+7) Choosing the right stage
+
+Put labels in file_match when they are inherent to the file source (path-based, constant).
+
+Use static_labels for global, constant enrichment in one place.
+
+Use labels to promote parsed fields (after json/logfmt/regex).
+
+Use relabel to rename, rewrite, or drop labels.
+
+Keep an eye on cardinality: every distinct label set creates a separate stream in Loki.
+
+8) Quick troubleshooting checklist
+
+Did you add a parsing stage before stage.labels?
+
+Are you querying the new label set in Explore (or using a wide enough selector)?
+
+Did you unintentionally change label keys/values—creating new streams?
+
+Check Alloy’s Live Debugging and Loki’s /ready & /metrics for pipeline health.
