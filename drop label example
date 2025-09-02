@@ -1,0 +1,50 @@
+loki.relabel "drop_detected" {
+  rule {
+    action = "labeldrop"
+    regex  = "detected_level"
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+------
+
+Full config exmaple:
+
+local.file_match "local" {
+  path_targets = [{
+    __path__ = "/var/log/system.log",
+  }]
+  sync_period = "10s"
+}
+
+loki.source.file "local" {
+  targets    = local.file_match.local.targets
+  tail_from_end = false
+  forward_to = [loki.process.add_labels.receiver]
+}
+
+loki.process "add_labels" {
+  stage.static_labels {
+    values = {
+      color  = "blue",
+      env    = "testing_logs",
+      deploy = "alloylogstest",
+    }
+  }
+
+  forward_to = [loki.relabel.drop_detected.receiver]
+}
+
+loki.relabel "drop_detected" {
+  rule {
+    action = "labeldrop"
+    regex  = "detected_level"
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://host.docker.internal:3100/loki/api/v1/push"
+  }
+}
