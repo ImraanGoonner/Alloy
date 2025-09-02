@@ -1,50 +1,86 @@
-loki.relabel "drop_detected" {
-  rule {
-    action = "labeldrop"
-    regex  = "detected_level"
-  }
-  forward_to = [loki.write.local.receiver]
-}
+Dropping labels in Grafana Alloy (for Loki)
 
-------
+When scraping logs with Alloy, you often add labels (e.g., with stage.static_labels) and then want to remove unneeded ones to reduce cardinality or avoid noisy fields. In Alloy, label removal is done with loki.relabel, not inside loki.process.
 
-Full config exmaple:
+Quick rules
+
+Add labels: loki.process → stage.static_labels.
+
+Remove/keep labels: loki.relabel with action = "labeldrop" (or labelkeep).
+
+Put loki.relabel after any loki.process stages and before loki.write.
+
+This changes only newly ingested log streams; existing data in Loki is immutable.
+
+Minimal example: drop a single label
+
+Drops the detected_level label from all streams.
 
 local.file_match "local" {
-  path_targets = [{
-    __path__ = "/var/log/system.log",
-  }]
-  sync_period = "10s"
+  path_targets = [{ __path__ = "/var/log/system.log" }]
+  sync_period  = "10s"
 }
 
 loki.source.file "local" {
-  targets    = local.file_match.local.targets
-  tail_from_end = false
-  forward_to = [loki.process.add_labels.receiver]
+  targets        = local.file_match.local.targets
+  tail_from_end  = false
+  forward_to     = [loki.process.add_labels.receiver]
 }
 
 loki.process "add_labels" {
   stage.static_labels {
-    values = {
-      color  = "blue",
-      env    = "testing_logs",
-      deploy = "alloylogstest",
-    }
+    values = { env = "testing_logs", app = "demo" }
   }
-
-  forward_to = [loki.relabel.drop_detected.receiver]
+  forward_to = [loki.relabel.drop_noise.receiver]
 }
 
-loki.relabel "drop_detected" {
+loki.relabel "drop_noise" {
   rule {
     action = "labeldrop"
-    regex  = "detected_level"
+    regex  = "detected_level"   # label name to drop
   }
   forward_to = [loki.write.local.receiver]
 }
 
 loki.write "local" {
-  endpoint {
-    url = "http://host.docker.internal:3100/loki/api/v1/push"
-  }
+  endpoint { url = "http://host.docker.internal:3100/loki/api/v1/push" }
 }
+
+Drop multiple labels by pattern
+
+Keep your label set tight by dropping name patterns:
+
+loki.relabel "tidy_labels" {
+  # Drop any labels starting with k8s_ or kubernetes_
+  rule { action = "labeldrop"; regex = "^(k8s_|kubernetes_).*" }
+
+  # Also drop some known-noisy fields
+  rule { action = "labeldrop"; regex = "(__path__|filename|container_hash)" }
+
+  forward_to = [loki.write.local.receiver]
+}
+
+Keep only a whitelist (alternative)
+
+Instead of dropping many, keep the few you care about:
+
+loki.relabel "keep_small_set" {
+  rule {
+    action = "labelkeep"
+    # Only keep these label names
+    regex  = "^(job|instance|app|env|level)$"
+  }
+  forward_to = [loki.write.local.receiver]
+}
+
+Notes & gotchas
+
+labeldrop/labelkeep match label names, not their values.
+
+Use keep/drop (different actions) with source_labels to filter entire streams; don’t confuse them with labelkeep/labeldrop which only adjust labels.
+
+Don’t drop labels your dashboards/alerts rely on.
+
+Loki requires streams to have labels—don’t strip everything.
+
+Verify in Grafana Explore with LogQL: check that label_values({your-selector}, detected_level) returns nothing after the change, or inspect a stream’s labels in the sidebar.
