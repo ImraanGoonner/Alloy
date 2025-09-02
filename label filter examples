@@ -1,0 +1,331 @@
+Alloy + Loki: Local Sanity-Checks (with Queries)
+
+This README walks you through quick, copy-paste sanity checks you can run against a local Alloy → Loki pipeline before you ship to Docker/K8s. Each section includes:
+
+What you’re testing
+
+The Alloy snippet (HCL)
+
+A query to verify it
+
+What to expect
+
+Pipeline recap:
+local.file_match (discover files + static per-file labels) → loki.source.file (tail/ingest) → loki.process ... (parse/enrich/filter/etc.) → loki.write (push to Loki)
+
+Minimal skeleton (wire once, then swap stages)
+local.file_match "local" {
+  path_targets = [{ __path__ = "/var/log/system.log" }]
+  sync_period  = "10s"
+}
+
+loki.source.file "local" {
+  targets       = local.file_match.local.targets
+  tail_from_end = false
+  forward_to    = [loki.process.stage_chain.receiver]  # <- chain entrypoint
+}
+
+# Replace the inner of this "stage_chain" block per section below
+loki.process "stage_chain" {
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint { url = "http://host.docker.internal:3100/loki/api/v1/push" }
+}
+
+
+In each section, replace the inside of loki.process "stage_chain" with the snippet provided.
+
+1) Multiline (stitch stack traces)
+
+Goal: Group multi-line entries (e.g., stack traces) into a single log record.
+
+Alloy:
+
+# inside loki.process "stage_chain"
+stage.multiline {
+  firstline = "^[A-Z][a-z]{2} +\\d+ \\d{2}:\\d{2}:\\d{2} "  # syslog-like start
+  max_wait  = "2s"
+}
+
+
+Verify (Loki / Explore):
+
+{filename="/var/log/system.log"} |= "Exception"
+
+
+Expect: Exceptions (and similar) appear as single entries, not fragmented lines.
+
+2) Parse & enrich (regex + timestamp + labels)
+
+Goal: Extract fields, set timestamp, promote a few fields as labels.
+
+Alloy:
+
+# inside loki.process "stage_chain"
+stage.regex {
+  expression = "^(?P<ts>\\w{3} +\\d+ \\d{2}:\\d{2}:\\d{2}) (?P<host>\\S+) (?P<proc>\\S+): (?P<msg>.*)$"
+}
+stage.timestamp {
+  source = "ts"
+  format = "Jan _2 15:04:05"
+}
+stage.labels {
+  values = { host = "host", process = "proc" }
+}
+
+
+Verify (Loki / Explore):
+
+{process=~".+"}  # should return logs with the new 'process' label
+
+
+Expect: New host and process labels appear; timestamps align to parsed value.
+
+3) Conditional filtering (drop noise)
+
+Goal: Drop DEBUG lines or any noisy pattern.
+
+Alloy:
+
+# inside loki.process "stage_chain"
+stage.drop { expression = ".*\\bDEBUG\\b.*" }
+
+
+Verify (Loki / Explore):
+
+count_over_time({filename="/var/log/system.log"}[5m])
+# Compare with/without drop enabled; DEBUG lines should disappear.
+
+
+Expect: Volume decreases; DEBUG lines are gone.
+
+4) Redaction (scrub secrets)
+
+Goal: Remove sensitive values before they leave the host.
+
+Alloy:
+
+# inside loki.process "stage_chain"
+stage.replace {
+  expression = "(password|token)=\\S+"
+  replace    = "$1=<redacted>"
+}
+
+
+Verify (Loki / Explore):
+
+{filename="/var/log/system.log"} |= "password="
+
+
+Expect: Matching lines show password=<redacted> (or token=<redacted>).
+
+5) Metrics from logs (quick counters)
+
+Goal: Emit Prometheus metrics from matched log content.
+
+Alloy:
+
+# inside loki.process "stage_chain"
+stage.regex {
+  expression = "level=(?P<lvl>INFO|WARN|ERROR)"
+}
+stage.metrics {
+  counter {
+    name        = "log_level_total"
+    description = "Count of logs by level"
+    match_all   = true
+    labels      = { level = "lvl" }
+  }
+}
+
+
+Verify (Prometheus / PromQL):
+
+sum by (level) (rate(log_level_total[5m]))
+
+
+Expect: A per-level rate you can graph/alert on.
+
+6) Decompression (read .gz rotations)
+
+Goal: Verify Alloy tails compressed rotations.
+
+Alloy:
+
+# in loki.source.file "local" (replace block)
+decompression {
+  enabled = true
+  format  = "gz"
+}
+
+
+Verify (Loki / Explore):
+
+{filename=~"/var/log/system.log(.\\d+)?(.gz)?"}
+
+
+Expect: Entries from compressed rotations appear in queries.
+
+7) Wildcards & discovery (per-file labels)
+
+Goal: Discover multiple files, tag them differently.
+
+Alloy:
+
+# in local.file_match "local"
+path_targets = [
+  { __path__ = "/var/log/system.log", source = "syslog" },
+  { __path__ = "/var/log/*.log",      source = "varlog" },
+]
+
+
+Verify (Loki / Explore):
+
+sum by (source) (count_over_time({source=~".+"}[5m]))
+
+
+Expect: Both syslog and varlog sources show up.
+
+8) Label hygiene (rename / map)
+
+Goal: Tidy labels (rename proc → process, etc.).
+
+Alloy:
+
+# inside loki.process "stage_chain"
+stage.regex {
+  expression = "^(?P<proc>\\S+): (?P<msg>.*)$"
+}
+stage.labels {
+  values = { proc = "proc" }
+}
+# Relabel: proc -> process
+loki.relabel "tidy" {
+  forward_to = [loki.write.local.receiver]
+  rule {
+    action      = "labelmap"
+    regex       = "proc"
+    replacement = "process"
+  }
+}
+
+
+Verify (Loki / Explore):
+
+{process=~".+"}
+
+
+Expect: process exists; proc is no longer present.
+
+9) Positions & restart behavior (no dupes)
+
+Goal: Ensure Alloy resumes from last position (no duplicates).
+
+How to test:
+
+Start Alloy, generate a few lines.
+
+Stop Alloy.
+
+Append new lines to /var/log/system.log.
+
+Start Alloy again.
+
+Verify (Loki / Explore):
+
+count_over_time({filename="/var/log/system.log"}[10m])
+
+
+Expect: Only new lines after restart are ingested.
+
+10) Failure paths & backpressure (detect issues)
+
+Goal: Observe retries/queues when Loki is down.
+
+How to test:
+
+Stop Loki.
+
+Generate logs for ~1–2 minutes.
+
+Start Loki.
+
+Verify (Prometheus / PromQL; scrape Alloy’s /metrics):
+
+rate(alloy_loki_write_send_failures_total[5m])
+rate(alloy_loki_write_sent_entries_total[5m])
+alloy_loki_write_queue_length
+
+
+Expect: Failures spike while down; queue grows; then drains after Loki returns.
+
+11) Live Tail & quick checks (Explore)
+
+Goal: Validate end-to-end ingestion interactively.
+
+Useful LogQL snippets:
+
+# Show only this file
+{filename="/var/log/system.log"}
+
+# Search by keyword
+{filename="/var/log/system.log"} |= "ERROR"
+
+# Quick volume by label
+sum by (process) (count_over_time({process=~".+"}[5m]))
+
+
+Expect: You can live-tail and filter by the labels you created.
+
+Full chained example
+
+Here’s an example chaining multiple stages together:
+
+loki.process "stage_chain" {
+  # 1) Multiline
+  stage.multiline {
+    firstline = "^[A-Z][a-z]{2} +\\d+ \\d{2}:\\d{2}:\\d{2} "
+    max_wait  = "2s"
+  }
+
+  # 2) Parse fields + timestamp + labels
+  stage.regex {
+    expression = "^(?P<ts>\\w{3} +\\d+ \\d{2}:\\d{2}:\\d{2}) (?P<host>\\S+) (?P<proc>\\S+): (?P<msg>.*)$"
+  }
+  stage.timestamp { source = "ts" format = "Jan _2 15:04:05" }
+  stage.labels    { values  = { host = "host", proc = "proc" } }
+
+  # 3) Filter out DEBUG
+  stage.drop { expression = ".*\\bDEBUG\\b.*" }
+
+  # 4) Redact secrets
+  stage.replace {
+    expression = "(password|token)=\\S+"
+    replace    = "$1=<redacted>"
+  }
+
+  # 5) Metrics from logs
+  stage.regex   { expression = "level=(?P<lvl>INFO|WARN|ERROR)" }
+  stage.metrics {
+    counter {
+      name        = "log_level_total"
+      description = "Count of logs by level"
+      match_all   = true
+      labels      = { level = "lvl" }
+    }
+  }
+
+  forward_to = [loki.write.local.receiver]
+}
+
+Tips
+
+Order matters. Parse fields before you use them for labels or metrics.
+
+Label budget. Keep labels low-cardinality (host, process, env); avoid per-request IDs.
+
+Test one change at a time. Swap in a single stage, validate, then add the next.
+
+If you want this as a ready-to-run file with your current base, I can stitch it for your exact paths and labels.
